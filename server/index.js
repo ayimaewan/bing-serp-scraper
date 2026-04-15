@@ -68,21 +68,31 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function randBetween(min, max) { return Math.random() * (max - min) + min; }
 
 async function fetchBing(keyword, retries = 3) {
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(keyword)}&count=10`;
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(keyword)}&count=10&setlang=en`;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      const ua = randomUA();
       const resp = await fetch(url, {
         headers: {
-          "User-Agent": randomUA(),
+          "User-Agent": ua,
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.9",
-          "Accept-Encoding": "gzip, deflate, br",
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache",
         },
+        redirect: "follow",
       });
-      if (resp.status === 200) return await resp.text();
+      console.log(`[Bing] "${keyword}" attempt ${attempt}: status=${resp.status}, url=${resp.url}`);
+      if (resp.status === 200) {
+        const html = await resp.text();
+        console.log(`[Bing] "${keyword}": got ${html.length} chars, has b_algo=${html.includes('b_algo')}, has b_results=${html.includes('b_results')}`);
+        return html;
+      }
       if (resp.status === 429) { await sleep(10000 * attempt); continue; }
+      console.log(`[Bing] "${keyword}": unexpected status ${resp.status}`);
       await sleep(5000);
     } catch (e) {
+      console.error(`[Bing] "${keyword}" error:`, e.message);
       if (attempt === retries) return null;
       await sleep(5000);
     }
@@ -93,6 +103,8 @@ async function fetchBing(keyword, retries = 3) {
 function parseSERP(html) {
   const $ = cheerio.load(html);
   const results = [];
+
+  // Strategy 1: Standard Bing organic results (li.b_algo)
   $("li.b_algo").each((i, el) => {
     const linkTag = $(el).find("h2 a").first();
     if (!linkTag.length) return;
@@ -101,9 +113,43 @@ function parseSERP(html) {
       title: linkTag.text().trim(),
       url: linkTag.attr("href") || "",
       displayUrl: ($(el).find("cite").first().text() || "").trim(),
-      snippet: ($(el).find("div.b_caption p").first().text() || "").trim(),
+      snippet: ($(el).find("div.b_caption p").first().text() || $(el).find("p").first().text() || "").trim(),
     });
   });
+
+  // Strategy 2: Alternative Bing markup (#b_results .b_algo)
+  if (results.length === 0) {
+    $("#b_results .b_algo").each((i, el) => {
+      const linkTag = $(el).find("a").first();
+      if (!linkTag.length) return;
+      results.push({
+        position: i + 1,
+        title: linkTag.text().trim(),
+        url: linkTag.attr("href") || "",
+        displayUrl: ($(el).find("cite").first().text() || "").trim(),
+        snippet: ($(el).find("p").first().text() || "").trim(),
+      });
+    });
+  }
+
+  // Strategy 3: Generic fallback — any result-like links with h2 or h3
+  if (results.length === 0) {
+    $("h2 a[href^='http']").each((i, el) => {
+      const href = $(el).attr("href") || "";
+      // Skip Bing internal links
+      if (href.includes("bing.com") || href.includes("microsoft.com") || href.includes("go.microsoft")) return;
+      const parent = $(el).closest("li, div.b_algo, div[class*='result'], div[class*='algo']");
+      results.push({
+        position: results.length + 1,
+        title: $(el).text().trim(),
+        url: href,
+        displayUrl: (parent.find("cite").first().text() || "").trim(),
+        snippet: (parent.find("p").first().text() || "").trim(),
+      });
+    });
+  }
+
+  console.log(`[Parser] Found ${results.length} results via ${results.length > 0 ? 'selectors' : 'none'}`);
   return results;
 }
 
@@ -442,6 +488,26 @@ app.get("/api/schedules/:id/download", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Debug endpoint — test what Bing returns from this server's IP
+app.get("/api/debug/bing", async (req, res) => {
+  const kw = req.query.q || "test";
+  const html = await fetchBing(kw, 1);
+  if (!html) return res.json({ error: "Fetch failed", keyword: kw });
+  const $ = cheerio.load(html);
+  const parsed = parseSERP(html);
+  res.json({
+    keyword: kw,
+    htmlLength: html.length,
+    title: $("title").text(),
+    hasAlgo: html.includes("b_algo"),
+    hasResults: html.includes("b_results"),
+    hasCaptcha: html.includes("captcha") || html.includes("CAPTCHA") || html.includes("unusual traffic"),
+    parsedCount: parsed.length,
+    parsed: parsed.slice(0, 3),
+    htmlSnippet: html.slice(0, 2000),
+  });
+});
+
 // Health + SPA fallback
 // ---------------------------------------------------------------------------
 app.get("/api/health", (req, res) => res.json({ status: "ok", activeSchedules: schedules.filter((s) => s.active).length }));
