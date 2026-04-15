@@ -1,0 +1,11 @@
+{
+  "name": "bing-serp-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "server": "cd server && node index.js",
+    "client:build": "cd client && npm run build",
+    "install:all": "cd server && npm install && cd ../client && npm install",
+    "start": "cd server && node index.js"
+  }
+}
