@@ -144,6 +144,8 @@ function ScrapeTab() {
   const [keywords, setKeywords] = useState("");
   const [delayMin, setDelayMin] = useState(2);
   const [delayMax, setDelayMax] = useState(5);
+  const [method, setMethod] = useState("auto");
+  const [engines, setEngines] = useState({});
   const [jobId, setJobId] = useState(null);
   const [progress, setProgress] = useState(null);
   const [results, setResults] = useState([]);
@@ -151,6 +153,14 @@ function ScrapeTab() {
   const esRef = useRef(null);
   const fileRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
+
+  // Load available engines on mount
+  useEffect(() => {
+    fetch(`${API}/api/config`).then((r) => r.json()).then((cfg) => {
+      setEngines(cfg.engines || {});
+      setMethod(cfg.defaultMethod || "auto");
+    }).catch(() => {});
+  }, []);
 
   const kwList = keywords.split("\n").map((s) => s.trim()).filter(Boolean);
 
@@ -173,7 +183,7 @@ function ScrapeTab() {
   const startScrape = async () => {
     if (!kwList.length) return;
     setPhase("running"); setProgress(null); setResults([]);
-    const resp = await fetch(`${API}/api/scrape`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keywords: kwList, delayMin, delayMax }) });
+    const resp = await fetch(`${API}/api/scrape`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keywords: kwList, delayMin, delayMax, method }) });
     const data = await resp.json();
     setJobId(data.jobId);
     startStream(data.jobId);
@@ -216,6 +226,25 @@ function ScrapeTab() {
           <div className="settings-row">
             <div className="setting-group"><label>Min delay (s)</label><input type="number" min={1} max={30} value={delayMin} onChange={(e) => setDelayMin(+e.target.value)} /></div>
             <div className="setting-group"><label>Max delay (s)</label><input type="number" min={1} max={60} value={delayMax} onChange={(e) => setDelayMax(+e.target.value)} /></div>
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <label className="form-label">Search Engine Method</label>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {[
+                { key: "auto", label: "Auto (best available)" },
+                ...(engines.bing_api?.available ? [{ key: "bing_api", label: "Bing API" }] : []),
+                ...(engines.scraper_api?.available ? [{ key: "scraper_api", label: "ScraperAPI Proxy" }] : []),
+                { key: "direct", label: "Direct Scrape" },
+              ].map((eng) => (
+                <button key={eng.key} className={`btn btn-sm ${method === eng.key ? "btn-primary" : "btn-ghost"}`} onClick={() => setMethod(eng.key)} style={{ fontSize: 11 }}>
+                  {eng.label}
+                  {eng.key === "bing_api" && !engines.bing_api?.available && <span style={{ opacity: 0.5 }}> (no key)</span>}
+                </button>
+              ))}
+            </div>
+            {method === "bing_api" && <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-dim)", marginTop: 6 }}>Official Bing API — reliable structured results. 1,000 free calls/month.</div>}
+            {method === "scraper_api" && <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-dim)", marginTop: 6 }}>Proxied via residential IPs — best for bulk scraping. 5,000 free credits/month.</div>}
+            {method === "direct" && <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--orange)", marginTop: 6 }}>Direct scraping may be blocked from datacenter IPs.</div>}
           </div>
           <div className="controls">
             <div className="kw-count"><strong>{kwList.length}</strong> keyword{kwList.length !== 1 ? "s" : ""}{kwList.length > 0 && <span> · ~{Math.ceil(kwList.length * ((delayMin + delayMax) / 2) / 60)} min est.</span>}</div>
@@ -280,6 +309,8 @@ function SchedulesTab() {
   const [frequency, setFrequency] = useState("daily");
   const [timeOfDay, setTimeOfDay] = useState("06:00");
   const [timezone, setTimezone] = useState("UTC");
+  const [method, setMethod] = useState("auto");
+  const [engines, setEngines] = useState({});
   const fileRef = useRef(null);
 
   const load = useCallback(async () => {
@@ -289,13 +320,14 @@ function SchedulesTab() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { fetch(`${API}/api/config`).then((r) => r.json()).then((cfg) => { setEngines(cfg.engines || {}); setMethod(cfg.defaultMethod || "auto"); }).catch(() => {}); }, []);
 
   const createSchedule = async () => {
     const kwList = keywords.split("\n").map((s) => s.trim()).filter(Boolean);
     if (!kwList.length) return;
     await fetch(`${API}/api/schedules`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name || undefined, keywords: kwList, frequency, timeOfDay, timezone }),
+      body: JSON.stringify({ name: name || undefined, keywords: kwList, frequency, timeOfDay, timezone, method }),
     });
     setShowCreate(false); setName(""); setKeywords(""); load();
   };
@@ -410,6 +442,24 @@ function SchedulesTab() {
           </div>
         </div>
 
+        <div className="form-row">
+          <div className="form-group" style={{ flex: "1 1 100%" }}>
+            <label className="form-label">Search Method</label>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {[
+                { key: "auto", label: "Auto (best available)" },
+                ...(engines.bing_api?.available ? [{ key: "bing_api", label: "Bing API" }] : []),
+                ...(engines.scraper_api?.available ? [{ key: "scraper_api", label: "ScraperAPI Proxy" }] : []),
+                { key: "direct", label: "Direct Scrape" },
+              ].map((eng) => (
+                <button key={eng.key} className={`btn btn-sm ${method === eng.key ? "btn-primary" : "btn-ghost"}`} onClick={() => setMethod(eng.key)} type="button" style={{ fontSize: 11 }}>
+                  {eng.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
         <label className="form-label" style={{ marginBottom: 8 }}>Keywords</label>
         <div className="file-drop" onClick={() => fileRef.current?.click()}>
           <div className="file-drop-text">Drop a .txt or .csv here, or click to upload</div>
@@ -459,7 +509,7 @@ function SchedulesTab() {
             </div>
             <div className="sched-meta">
               <strong>Keywords:</strong> {s.keywords.join(", ")}<br />
-              <strong>Time:</strong> {s.timeOfDay} {s.timezone}<br />
+              <strong>Time:</strong> {s.timeOfDay} {s.timezone} · <strong>Method:</strong> {s.method === "bing_api" ? "Bing API" : s.method === "scraper_api" ? "ScraperAPI" : s.method === "direct" ? "Direct" : "Auto"}<br />
               <strong>Runs:</strong> {s.runCount || 0}{s.lastRun ? ` · Last: ${s.lastRun}` : ""}
             </div>
             <div className="sched-actions">

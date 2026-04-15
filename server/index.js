@@ -185,6 +185,142 @@ async function scrapeKeywords(keywords, delayMin = 2, delayMax = 5, jobRef = nul
 }
 
 // ---------------------------------------------------------------------------
+// Engine 2: Bing Web Search API (structured JSON, no parsing needed)
+// Free tier: 1,000 calls/month — ideal for scheduled single-keyword tracking
+// Set BING_API_KEY env var in Railway
+// ---------------------------------------------------------------------------
+const BING_API_KEY = process.env.BING_API_KEY || "";
+const BING_API_ENDPOINT = process.env.BING_API_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search";
+
+async function bingApiSearch(keyword, count = 10) {
+  if (!BING_API_KEY) throw new Error("BING_API_KEY not configured");
+  const url = `${BING_API_ENDPOINT}?q=${encodeURIComponent(keyword)}&count=${count}&mkt=en-US`;
+  const resp = await fetch(url, {
+    headers: { "Ocp-Apim-Subscription-Key": BING_API_KEY },
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    console.error(`[BingAPI] "${keyword}": ${resp.status} — ${err}`);
+    throw new Error(`Bing API ${resp.status}`);
+  }
+  const data = await resp.json();
+  const results = [];
+  for (const item of (data.webPages?.value || [])) {
+    results.push({
+      position: results.length + 1,
+      title: item.name || "",
+      url: item.url || "",
+      displayUrl: item.displayUrl || "",
+      snippet: item.snippet || "",
+    });
+  }
+  console.log(`[BingAPI] "${keyword}": ${results.length} results`);
+  return results;
+}
+
+async function bingApiScrapeKeywords(keywords, jobRef = null) {
+  const allResults = [];
+  const failed = [];
+
+  for (let i = 0; i < keywords.length; i++) {
+    if (jobRef && jobRef.status === "cancelled") break;
+    const kw = keywords[i].trim();
+    if (!kw) continue;
+
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    try {
+      const parsed = await bingApiSearch(kw);
+      for (const r of parsed) allResults.push({ keyword: kw, scrapedAt: now, ...r });
+    } catch (e) {
+      console.error(`[BingAPI] "${kw}" failed:`, e.message);
+      failed.push(kw);
+    }
+
+    if (jobRef) { jobRef.completed = i + 1; jobRef.failed = failed.length; jobRef.results = allResults; }
+    if (i < keywords.length - 1) await sleep(200); // API is fast, small delay for rate limiting
+  }
+
+  return { results: allResults, failed };
+}
+
+// ---------------------------------------------------------------------------
+// Engine 3: ScraperAPI proxy (for bulk scraping without getting blocked)
+// Free tier: 5,000 credits/month
+// Set SCRAPER_API_KEY env var in Railway
+// ---------------------------------------------------------------------------
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || "";
+
+async function fetchBingViaScraperApi(keyword, retries = 2) {
+  if (!SCRAPER_API_KEY) throw new Error("SCRAPER_API_KEY not configured");
+  const targetUrl = `https://www.bing.com/search?q=${encodeURIComponent(keyword)}&count=10&setlang=en`;
+  const apiUrl = `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(targetUrl)}&render=false`;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const resp = await fetch(apiUrl, { headers: { "Accept": "text/html" } });
+      console.log(`[ScraperAPI] "${keyword}" attempt ${attempt}: status=${resp.status}`);
+      if (resp.ok) {
+        const html = await resp.text();
+        console.log(`[ScraperAPI] "${keyword}": ${html.length} chars, has b_algo=${html.includes("b_algo")}`);
+        return html;
+      }
+      if (resp.status === 429) { await sleep(5000 * attempt); continue; }
+      await sleep(3000);
+    } catch (e) {
+      console.error(`[ScraperAPI] "${keyword}" error:`, e.message);
+      if (attempt === retries) return null;
+      await sleep(3000);
+    }
+  }
+  return null;
+}
+
+async function scraperApiScrapeKeywords(keywords, delayMin = 2, delayMax = 4, jobRef = null) {
+  const allResults = [];
+  const failed = [];
+
+  for (let i = 0; i < keywords.length; i++) {
+    if (jobRef && jobRef.status === "cancelled") break;
+    const kw = keywords[i].trim();
+    if (!kw) continue;
+
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const html = await fetchBingViaScraperApi(kw);
+    if (html) {
+      const parsed = parseSERP(html);
+      for (const r of parsed) allResults.push({ keyword: kw, scrapedAt: now, ...r });
+    } else {
+      failed.push(kw);
+    }
+
+    if (jobRef) { jobRef.completed = i + 1; jobRef.failed = failed.length; jobRef.results = allResults; }
+    if (i < keywords.length - 1) await sleep(randBetween(delayMin, delayMax) * 1000);
+  }
+
+  return { results: allResults, failed };
+}
+
+// ---------------------------------------------------------------------------
+// Unified scrape dispatcher — picks the right engine based on method param
+// ---------------------------------------------------------------------------
+async function dispatchScrape(keywords, method = "auto", delayMin = 2, delayMax = 5, jobRef = null) {
+  // Auto: use Bing API if configured, else ScraperAPI if configured, else direct
+  if (method === "auto") {
+    if (BING_API_KEY) method = "bing_api";
+    else if (SCRAPER_API_KEY) method = "scraper_api";
+    else method = "direct";
+  }
+
+  console.log(`[Dispatch] method=${method}, keywords=${keywords.length}`);
+
+  switch (method) {
+    case "bing_api": return bingApiScrapeKeywords(keywords, jobRef);
+    case "scraper_api": return scraperApiScrapeKeywords(keywords, delayMin, delayMax, jobRef);
+    case "direct": default: return scrapeKeywords(keywords, delayMin, delayMax, jobRef);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Excel generators
 // ---------------------------------------------------------------------------
 async function generateExcel(allData) {
@@ -301,8 +437,8 @@ function frequencyToCron(freq, timeOfDay = "06:00") {
 }
 
 async function executeScheduledRun(schedule) {
-  console.log(`[Scheduler] Running "${schedule.name}" (${schedule.keywords.join(", ")})`);
-  const { results, failed } = await scrapeKeywords(schedule.keywords, 3, 6);
+  console.log(`[Scheduler] Running "${schedule.name}" (${schedule.keywords.join(", ")}) via ${schedule.method || "auto"}`);
+  const { results, failed } = await dispatchScrape(schedule.keywords, schedule.method || "auto", 3, 6);
 
   const runRecord = {
     id: uuidv4(),
@@ -343,16 +479,16 @@ console.log(`[Scheduler] Restored ${schedules.filter((s) => s.active).length} ac
 // API: One-off scrapes
 // ---------------------------------------------------------------------------
 app.post("/api/scrape", (req, res) => {
-  const { keywords, delayMin = 2, delayMax = 5 } = req.body;
+  const { keywords, delayMin = 2, delayMax = 5, method = "auto" } = req.body;
   if (!keywords?.length) return res.status(400).json({ error: "Provide a keywords array" });
   if (keywords.length > 1000) return res.status(400).json({ error: "Max 1000 keywords" });
 
   const jobId = uuidv4();
-  const job = { id: jobId, status: "running", total: keywords.length, completed: 0, failed: 0, results: [], failedKeywords: [], createdAt: Date.now(), excelPath: null };
+  const job = { id: jobId, status: "running", total: keywords.length, completed: 0, failed: 0, results: [], failedKeywords: [], createdAt: Date.now(), excelPath: null, method };
   jobs.set(jobId, job);
 
   (async () => {
-    const { results, failed } = await scrapeKeywords(keywords, delayMin, delayMax, job);
+    const { results, failed } = await dispatchScrape(keywords, method, delayMin, delayMax, job);
     job.results = results;
     job.failedKeywords = failed;
     job.completed = keywords.length;
@@ -405,7 +541,7 @@ app.get("/api/schedules", (req, res) => {
 });
 
 app.post("/api/schedules", (req, res) => {
-  const { name, keywords, frequency, timeOfDay, timezone } = req.body;
+  const { name, keywords, frequency, timeOfDay, timezone, method } = req.body;
   if (!keywords?.length) return res.status(400).json({ error: "Provide keywords" });
   if (!["daily", "weekly", "monthly"].includes(frequency)) return res.status(400).json({ error: "frequency must be daily, weekly, or monthly" });
 
@@ -416,6 +552,7 @@ app.post("/api/schedules", (req, res) => {
     frequency,
     timeOfDay: timeOfDay || "06:00",
     timezone: timezone || "UTC",
+    method: method || "auto",
     active: true,
     createdAt: new Date().toISOString(),
     lastRun: null,
@@ -488,6 +625,18 @@ app.get("/api/schedules/:id/download", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Config endpoint — tells frontend which engines are available
+app.get("/api/config", (req, res) => {
+  res.json({
+    engines: {
+      direct: { available: true, label: "Direct Scrape", description: "Scrapes Bing directly (may be blocked from datacenter IPs)" },
+      bing_api: { available: !!BING_API_KEY, label: "Bing Web Search API", description: "Official API — reliable, structured results (1,000 free/month)" },
+      scraper_api: { available: !!SCRAPER_API_KEY, label: "ScraperAPI Proxy", description: "Proxied scraping via residential IPs (5,000 free credits/month)" },
+    },
+    defaultMethod: BING_API_KEY ? "bing_api" : SCRAPER_API_KEY ? "scraper_api" : "direct",
+  });
+});
+
 // Debug endpoint — test what Bing returns from this server's IP
 app.get("/api/debug/bing", async (req, res) => {
   const kw = req.query.q || "test";
